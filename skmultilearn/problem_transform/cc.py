@@ -1,8 +1,10 @@
 from ..base.problem_transformation import ProblemTransformationBase
-from scipy.sparse import hstack
+from scipy.sparse import hstack, vstack
 from sklearn.exceptions import NotFittedError
+import sklearn.metrics as metrics
+from itertools import permutations
 import copy
-
+import math
 
 class ClassifierChain(ProblemTransformationBase):
     """Constructs a bayesian conditioned chain of per label classifiers
@@ -224,3 +226,66 @@ class ClassifierChain(ProblemTransformationBase):
             return list(range(self._label_count))
         except AttributeError:
             raise NotFittedError("This Classifier Chain has not been fit yet")
+
+
+def log_likelihood_loss(y, y_pred):
+    log_likelihood_loss = 0
+    for row in range(y.shape[0]):
+        if y.ndim == 1 :
+            if y[row] == 1:
+                log_likelihood_loss += (math.log(y_pred[row]) * -1)
+            else:
+                log_likelihood_loss += (math.log(1 - y_pred[row]) * -1)
+        elif y.ndim == 2 :
+            for column in range(y.shape[1]):
+                if y[row, column] == 1:
+                    log_likelihood_loss += (math.log(y_pred[row, column]) * -1)
+                else:
+                    log_likelihood_loss += (math.log(1 - y_pred[row, column]) * -1)
+    return log_likelihood_loss
+
+
+class ProbabilisticClassifierChain(ClassifierChain):
+    def __init__(self,classifier=None, require_dense=None, label_set=None):
+        super(ProbabilisticClassifierChain, self).__init__(classifier, require_dense)
+        self.label_set = label_set
+        self.order = label_set
+        self.copyable_attrs = ['classifier', 'require_dense', 'label_set']
+
+    def fit(self, X_tr, X_ts, y_tr, y_ts, order=None, scoring = 'LL', vervose = 1):
+        y = self._ensure_output_format(y_tr, sparse_format='csc', enforce_sparse=True)
+
+        if(self.label_set == None):
+            self.label_set = list(range(y.shape[1]))
+        self.label_count = len(self.label_set)
+        self.label_set_all = list(permutations(self.label_set, y.shape[1]))
+
+        best_score = 0.0; best_label_set = None;
+        for _label_set in self.label_set_all:
+            temp = ClassifierChain(self.classifier, self.require_dense, _label_set)
+            temp.fit(X_tr,y_tr,_label_set)
+            y_pred = temp.predict(X_ts)
+            if(scoring == 'EMA'):
+                score = metrics.accuracy_score(y_ts, y_pred)
+                if (score > best_score):
+                    best_score = score
+                    best_label_set = _label_set
+            if(scoring == 'LL'):
+                y_pred_prob = temp.predict_proba(X_ts)
+                score = log_likelihood_loss(y_ts, y_pred_prob)
+                if ((-1)*score > best_score or best_score == 0.0):
+                    best_score = (-1)*score
+                    best_label_set = _label_set
+            if(vervose !=0):
+                print("Label set : {} | {}: {}".format(_label_set, scoring, score))
+
+            del(temp)
+
+        if(scoring == 'LL'): best_score = (-1)*best_score;
+
+        print("Best_label_set : {} | {} : {}".format(best_label_set, scoring, best_score))
+        self.order = best_label_set
+        X_tr = vstack((X_tr, X_ts))
+        y_tr = vstack((y_tr, y_ts))
+        super().fit(X_tr,y_tr, best_label_set)
+
